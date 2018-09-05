@@ -29,7 +29,7 @@ Based on the Examples of the libraries
 MQTT = SHA1 Fingerprint=73:58:A2:E1:90:95:AF:D0:43:C7:60:01:39:52:93:35:A0:6B:3E:66
 
 */
-
+#define MQTT_SOCKET_TIMEOUT 30
 
 #include <IRremote.h>
 //#include <credentials.h>
@@ -41,6 +41,8 @@ MQTT = SHA1 Fingerprint=73:58:A2:E1:90:95:AF:D0:43:C7:60:01:39:52:93:35:A0:6B:3E
 #define SENDTOPIC "IR/key"
 #define COMMANDTOPIC "IR/command"
 #define SERVICETOPIC "IR/service"
+#define SERVICE_ALIVE "Alive"
+#define SERVICE_DEAD "Dead"
 
 int RECV_PIN = 12;
 int SEND_PIN = 13;
@@ -71,6 +73,8 @@ int toggle = 0; // The RC5/6 toggle state
 
 //MQTT
 IPAddress server(10, 0, 1, 12);
+void callback(char*, byte*, unsigned int);
+PubSubClient client(server, 1883, callback, wifiClient);
 
 //MQTT Connection Check
 SimpleTimer mqtttimer;
@@ -78,36 +82,51 @@ int mqtttimerid = 0;
 
 
 void callback(char* topic, byte* payload, unsigned int length) {
+  
   String IRcommand = "";
   int i = 0;
-  while (payload[i] > 0) {
+
+  digitalWrite(STATUS_PIN, HIGH);
+  while (i < length) {
     IRcommand = IRcommand + (char)payload[i];
     i++;
   }
-  DynamicJsonBuffer jsonBuffer(200);
-  JsonObject& root = jsonBuffer.parseObject(payload);
-
-  // Test if parsing succeeds.
-  if (!root.success()) {
-    Serial.println("parseObject() failed");
-    //return;
-  }
-  int type = root["type"]; 
-  unsigned long valu = root["value"];
-    int len = root["length"];
-  Serial.println("");
-  Serial.print("Payload ");
+  
+  Serial.print("IRcommand=");
   Serial.println(IRcommand);
-  Serial.print("type ");
-  Serial.println(type);
-  Serial.print("value ");
-  Serial.println(valu);
-    Serial.print("length ");
-  Serial.println(len);
-  sendCode(type, valu, len);
+
+  if ( 0==IRcommand.compareTo("PING") )
+  {
+    client.publish(SERVICETOPIC, SERVICE_ALIVE);
+  } 
+  else 
+  {
+    DynamicJsonBuffer jsonBuffer(200);
+    JsonObject& root = jsonBuffer.parseObject(IRcommand);
+  
+    // Test if parsing succeeds.
+    if (!root.success()) {
+      Serial.println("parseObject() failed");
+      //return;
+    }
+    int type = root["type"]; 
+    unsigned long valu = root["value"];
+    int len = root["length"];
+    Serial.println("");
+    Serial.print("Payload ");
+    Serial.println(IRcommand);
+    Serial.print("type ");
+    Serial.println(type);
+    Serial.print("value ");
+    Serial.println(valu);
+      Serial.print("length ");
+    Serial.println(len);
+    sendCode(type, valu, len);
+  }
+  digitalWrite(STATUS_PIN, LOW);  
 }
 
-PubSubClient client(server, 1883, callback, wifiClient);
+
 
 void publishMQTT(String topic, String message) {
   if (!client.connected()) {
@@ -116,17 +135,20 @@ void publishMQTT(String topic, String message) {
   client.publish(topic.c_str(), message.c_str());
 }
 
+// simple MQTT reconnection handler
 void reconnect() {
-  // Loop until we're reconnected
-  mqtttimer.disable(mqtttimerid);
+
+  digitalWrite(STATUS_PIN, HIGH); 
   
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
-    if (client.connect("Mailbox")) {
+    if (client.connect("IRB","homebridge", "leapfr0g", SERVICETOPIC, 1, false, SERVICE_DEAD )) {
       Serial.println("connected");
+      client.subscribe(COMMANDTOPIC);
       // Once connected, publish an announcement...
-      client.publish(SERVICETOPIC, "I am live again");
+      Serial.println("(3)Sending Alive");
+      client.publish(SERVICETOPIC, SERVICE_ALIVE);
       // ... and resubscribe
       //  client.subscribe("inTopic");
     } else {
@@ -134,12 +156,17 @@ void reconnect() {
       Serial.print(client.state());
       Serial.println(" try again in 5 seconds");
       // Wait 5 seconds before retrying
-      delay(5000);
+      digitalWrite(STATUS_PIN, LOW); 
+      delay(500);
+      digitalWrite(STATUS_PIN, HIGH); 
+      delay(500);
+      digitalWrite(STATUS_PIN, LOW);
+      delay(500);
+      digitalWrite(STATUS_PIN, HIGH); 
+      delay(3500);
     }
   }
-
-  mqtttimer.enable(mqtttimerid);
-  mqtttimer.restartTimer(mqtttimerid);
+  digitalWrite(STATUS_PIN, LOW); 
 }
 
 
@@ -220,6 +247,7 @@ void storeCode(decode_results *results) {
     root["length"] = results->bits;
     root.printTo(IRcommand);
     root.prettyPrintTo(Serial);
+    // call the "safe" publish method which can reconnect if the connection has been lost
     publishMQTT(SENDTOPIC, IRcommand);
   }
 }
@@ -276,17 +304,53 @@ void sendCode( int codeType, unsigned long codeValue, int codeLen) {
 
 void mqttConnectionCheck()
 {
+  Serial.print("Checking connectivity..");
+  digitalWrite(STATUS_PIN, HIGH);
+  
+  bool timerDisabled = false;
+  // 1st step is to make sure WiFi is still connected
+  if (WiFi.status() != WL_CONNECTED) {
+
+    mqtttimer.disable(mqtttimerid);  
+    timerDisabled = true;
+
+    Serial.print("Reconnecting WiFi.");
+    // Loop until we're reconnected   
+    WiFi.begin (ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+      Serial.print(".");
+      digitalWrite(STATUS_PIN, LOW); 
+      delay(500);
+      digitalWrite(STATUS_PIN, HIGH); 
+    }
+    Serial.println(".done!");
+  }
+  
   if (!client.connected()) {
+    // This will reconnect and send an ALIVE message
+    mqtttimer.disable(mqtttimerid);
+    timerDisabled = true;
     reconnect();
   } else {
-    client.publish(SERVICETOPIC, "Still Here");   
+    // This is the alive message we want to send on the timer
+    Serial.println("(1)Sending Alive");
+    client.publish(SERVICETOPIC, SERVICE_ALIVE);   
   }
+
+  if (timerDisabled) {
+    // restart the timer if we had to stop it
+    mqtttimer.enable(mqtttimerid);
+    mqtttimer.restartTimer(mqtttimerid);  
+  }
+  Serial.println("Check Complete");
+  digitalWrite(STATUS_PIN, LOW); 
 }
 
 void setup()
 {
   Serial.begin(115200);
   pinMode(STATUS_PIN, OUTPUT);
+  digitalWrite(STATUS_PIN, HIGH);
 
   Serial.println("Connecting to Wi - Fi");
 
@@ -303,17 +367,23 @@ void setup()
   StaticJsonBuffer<200> jsonBuffer;
 
   // MQTT
-  if (client.connect("Mailbox", "homebridge", "leapfr0g")) {
-    client.publish(SERVICETOPIC, "IR Box live");
+  if (client.connect("IRB","homebridge", "leapfr0g", SERVICETOPIC, 1, false, SERVICE_DEAD )) {
+    Serial.println("(2)Sending Alive");
+    client.publish(SERVICETOPIC, SERVICE_ALIVE);
     client.subscribe(COMMANDTOPIC);
     Serial.println("MQTT Connected");
   } else {
     Serial.println("MQTT Not Connected");
+    digitalWrite(STATUS_PIN, LOW);
+    delay(500);
+    digitalWrite(STATUS_PIN, HIGH);
+    delay(500);         
   }
 
-  // check every 10 minutes
-  mqtttimerid = mqtttimer.setInterval(600000, mqttConnectionCheck);
+  // check every 2 minutes
+  mqtttimerid = mqtttimer.setInterval(120000, mqttConnectionCheck);
   Serial.println("Setup done");
+  digitalWrite(STATUS_PIN, LOW);  
 }
 
 void loop() {
@@ -324,5 +394,35 @@ void loop() {
     irrecv.resume(); // resume receiver
     digitalWrite(STATUS_PIN, LOW);
   }
-  client.loop();
+
+  switch(client.state()) {
+    case MQTT_CONNECTION_TIMEOUT:
+      break;
+    case MQTT_CONNECTION_LOST:
+      break;
+    case MQTT_CONNECT_FAILED:
+      break;
+    case MQTT_DISCONNECTED:
+      break;
+    case MQTT_CONNECTED:
+      break;           
+    case MQTT_CONNECT_BAD_PROTOCOL: 
+      break;  
+    case MQTT_CONNECT_BAD_CLIENT_ID:  
+      break;
+    case MQTT_CONNECT_UNAVAILABLE:
+      break;    
+    case MQTT_CONNECT_BAD_CREDENTIALS: 
+      break;
+    case MQTT_CONNECT_UNAUTHORIZED: 
+      break;  
+    default:  
+      break; 
+  }
+  if (!client.loop()) {
+    // this will also reconnect wifi if that connection was dropped
+    Serial.println("MQTT Disconnected?...Will try to reconnect");
+    mqttConnectionCheck();
+  }
+  
 }
